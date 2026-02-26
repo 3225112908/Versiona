@@ -2,8 +2,8 @@
 Versiona PostgreSQL Schema - Dual-dimension Context System.
 
 Core Design:
-1. Horizontal (tree): context_nodes table, parent_id forms tree structure
-2. Vertical (version): context_versions table, each node has multiple versions
+1. Horizontal (tree): {prefix}nodes table, parent_id forms tree structure
+2. Vertical (version): {prefix}versions table, each node has multiple versions
 3. Git features: branches, commits, diffs
 4. Dual-mode TTL: time expiration + turn expiration
 
@@ -14,31 +14,62 @@ Schema Design Principles:
 - Support time TTL (real-time info) and turn TTL (Agent loop process data)
 
 File Structure:
-- tables.py: Table definitions
-- functions.py: SQL function definitions
+- tables.py: Table definitions (customizable via VersionaConfig)
+- functions.py: SQL function definitions (customizable via VersionaConfig)
 - schema.py: Entry point, aggregates tables and functions
+
+Customization Example:
+    from versiona import VersionaConfig, get_schema_sql
+
+    config = VersionaConfig(
+        table_prefix="dxf_",
+        custom_enums={"entity_type": ["LINE", "CIRCLE", "ARC"]},
+        custom_node_columns={"handle": "VARCHAR(20)", "project_id": "UUID"},
+        custom_version_columns={"content": "TEXT", "min_x": "DOUBLE PRECISION"},
+    )
+
+    sql = get_schema_sql(config)
 """
 
 from __future__ import annotations
 
-from typing import Callable, Any
+from typing import Callable, Any, TYPE_CHECKING
 
 from versiona.db.tables import get_tables_sql, get_table_names
 from versiona.db.functions import get_functions_sql, get_function_names
+
+if TYPE_CHECKING:
+    from versiona.context.types import VersionaConfig
 
 
 # ============================================================
 # Core Schema
 # ============================================================
 
-def get_schema_sql() -> str:
+def get_schema_sql(config: "VersionaConfig | None" = None) -> str:
     """
     Get complete schema SQL (tables + functions).
 
+    Args:
+        config: Optional configuration for customization.
+                If None, uses default "context_" prefix with no custom columns.
+
     Returns:
         SQL string to create all tables and functions
+
+    Example:
+        # Default schema (context_nodes, context_versions, etc.)
+        sql = get_schema_sql()
+
+        # Custom schema (dxf_nodes, dxf_versions, etc. with custom columns)
+        config = VersionaConfig(
+            table_prefix="dxf_",
+            custom_node_columns={"handle": "VARCHAR(20)"},
+        )
+        sql = get_schema_sql(config)
     """
-    return get_tables_sql() + "\n" + get_functions_sql()
+    prefix = config.table_prefix if config else "context_"
+    return get_tables_sql(config) + "\n" + get_functions_sql(prefix)
 
 
 # Re-export for backward compatibility

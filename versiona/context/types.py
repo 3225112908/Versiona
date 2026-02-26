@@ -145,10 +145,34 @@ class VersionaConfig:
 
     Contains:
     - Connection settings: DSN, connection pool size, timeout
+    - Schema customization: table prefix, custom enums, custom columns
     - Auto cleanup settings
     - Dual-mode TTL defaults:
       - Time TTL: For real-time information (weather, stock prices, API responses)
       - Turn TTL: For Agent loop process data (thinking, tool_results)
+
+    Schema Customization Example:
+        config = VersionaConfig(
+            table_prefix="dxf_",  # Tables become dxf_nodes, dxf_versions, etc.
+
+            custom_enums={
+                "entity_type": ["LINE", "CIRCLE", "ARC", "TEXT", "MTEXT"],
+                "node_type": ["file", "layer", "block", "entity"],
+            },
+
+            custom_node_columns={
+                "handle": "VARCHAR(20)",
+                "entity_type": "entity_type",  # References custom enum
+                "project_id": "UUID",
+            },
+
+            custom_version_columns={
+                "content": "TEXT",
+                "min_x": "DOUBLE PRECISION",
+                "max_x": "DOUBLE PRECISION",
+                "binary_data": "BYTEA",
+            },
+        )
     """
 
     # Connection settings
@@ -157,7 +181,40 @@ class VersionaConfig:
     max_pool_size: int = 10
     command_timeout: float = 60.0
 
+    # ============================================================
+    # Schema Customization
+    # ============================================================
+
+    # Table prefix (e.g., "dxf_" -> dxf_nodes, dxf_versions)
+    table_prefix: str = "context_"
+
+    # Custom ENUMs: {enum_name: [value1, value2, ...]}
+    # These are created before tables
+    custom_enums: dict[str, list[str]] = field(default_factory=dict)
+
+    # Custom columns for nodes table: {column_name: column_type}
+    # Added after core columns
+    custom_node_columns: dict[str, str] = field(default_factory=dict)
+
+    # Custom columns for versions table: {column_name: column_type}
+    custom_version_columns: dict[str, str] = field(default_factory=dict)
+
+    # Custom columns for kv table: {column_name: column_type}
+    custom_kv_columns: dict[str, str] = field(default_factory=dict)
+
+    # Custom indexes: [(table_suffix, column_expr, index_type)]
+    # e.g., [("nodes", "handle", "btree"), ("versions", "content", "gin")]
+    custom_indexes: list[tuple[str, str, str]] = field(default_factory=list)
+
+    # Exclude default columns from versions table
+    # Available: "local_data", "output_data", "soft_deleted_keys"
+    # Use this when your use case doesn't need Agent-style local/output data separation
+    # Example: DXF storage only needs custom "content" column, not local_data/output_data
+    exclude_version_columns: set[str] = field(default_factory=set)
+
+    # ============================================================
     # Auto cleanup settings
+    # ============================================================
     auto_cleanup: bool = True
     cleanup_interval_seconds: int = 300  # 5 minutes
 
@@ -187,3 +244,39 @@ class VersionaConfig:
         "intermediate",
         "debug",
     })
+
+    # ============================================================
+    # Helper Methods
+    # ============================================================
+
+    def get_table_name(self, suffix: str) -> str:
+        """Get full table name with prefix."""
+        return f"{self.table_prefix}{suffix}"
+
+    @property
+    def nodes_table(self) -> str:
+        return self.get_table_name("nodes")
+
+    @property
+    def versions_table(self) -> str:
+        return self.get_table_name("versions")
+
+    @property
+    def branches_table(self) -> str:
+        return self.get_table_name("branches")
+
+    @property
+    def merges_table(self) -> str:
+        return self.get_table_name("merges")
+
+    @property
+    def tags_table(self) -> str:
+        return self.get_table_name("tags")
+
+    @property
+    def kv_table(self) -> str:
+        return self.get_table_name("kv")
+
+    @property
+    def snapshots_table(self) -> str:
+        return self.get_table_name("snapshots")

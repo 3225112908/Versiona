@@ -440,6 +440,21 @@ await client.fork_session(source_id, new_id, fork_at_turn, name, copy_kv)
 await client.merge(source_id, target_id, merge_type, message)
 await client.finalize(context_id, summary, output, artifacts)
 
+# Batch operations (new)
+await client.batch_kv_set(node_id, items, current_turn)
+await client.batch_commit(items, author_id)
+await client.batch_create_nodes(nodes)
+
+# Conflict resolution (new)
+conflicts = await client.detect_merge_conflicts(source_id, target_id)
+await client.merge_with_strategy(source_id, target_id, strategy, resolutions, message)
+
+# Maintenance & archiving (new)
+await client.compress_versions(node_id, keep_every, keep_recent, dry_run)
+await client.archive_old_nodes(older_than_days, status)
+await client.squash_versions(node_id, from_version, to_version, message)
+await client.run_maintenance(compress_keep_every, archive_older_than_days, current_turn)
+
 # Convenience methods
 await client.get_for_llm(context_id)
 await client.cleanup_expired(current_turn)
@@ -460,17 +475,127 @@ async with client.execution_context(id, parent_id, level, auto_finalize, auto_me
 
 ---
 
+## Schema Customization
+
+Versiona supports schema customization for domain-specific applications:
+
+### Table Prefix
+
+Change table names with a custom prefix:
+
+```python
+from versiona import VersionaConfig, get_schema_sql
+
+config = VersionaConfig(
+    table_prefix="dxf_",  # Tables become: dxf_nodes, dxf_versions, etc.
+)
+
+sql = get_schema_sql(config)
+```
+
+### Custom ENUMs
+
+Add domain-specific ENUM types:
+
+```python
+config = VersionaConfig(
+    table_prefix="dxf_",
+    custom_enums={
+        "entity_type": ["LINE", "CIRCLE", "ARC", "TEXT", "MTEXT"],
+        "node_type": ["file", "layer", "block", "entity"],
+    },
+)
+```
+
+### Custom Columns
+
+Add extra columns to core tables:
+
+```python
+config = VersionaConfig(
+    table_prefix="dxf_",
+
+    # Add columns to nodes table
+    custom_node_columns={
+        "handle": "VARCHAR(20)",
+        "entity_type": "entity_type",  # Uses custom enum
+        "project_id": "UUID",
+    },
+
+    # Add columns to versions table
+    custom_version_columns={
+        "content": "TEXT",  # AI-readable entity description
+        "min_x": "DOUBLE PRECISION",
+        "max_x": "DOUBLE PRECISION",
+        "binary_data": "BYTEA",
+    },
+
+    # Add custom indexes
+    custom_indexes=[
+        ("nodes", "handle", "btree"),
+        ("nodes", "project_id", "btree"),
+        ("versions", "min_x, min_y, max_x, max_y", "btree"),
+    ],
+)
+```
+
+### CAD Application Example
+
+Complete example for a CAD application:
+
+```python
+from versiona import VersionaClient, VersionaConfig
+
+# DXF document configuration
+DXF_CONFIG = VersionaConfig(
+    table_prefix="dxf_",
+
+    custom_enums={
+        "dxf_entity_type": [
+            "LINE", "CIRCLE", "ARC", "ELLIPSE",
+            "LWPOLYLINE", "SPLINE", "HATCH", "TEXT", "MTEXT",
+            "INSERT", "DIMENSION", "3DSOLID",
+        ],
+    },
+
+    custom_node_columns={
+        "entity_type": "dxf_entity_type",
+        "handle": "VARCHAR(20)",
+        "project_id": "UUID",
+    },
+
+    custom_version_columns={
+        "content": "TEXT",
+        "min_x": "DOUBLE PRECISION",
+        "min_y": "DOUBLE PRECISION",
+        "max_x": "DOUBLE PRECISION",
+        "max_y": "DOUBLE PRECISION",
+    },
+)
+
+# Initialize with custom config
+client = await VersionaClient.create(dsn, config=DXF_CONFIG)
+await client.init_schema()
+
+# Now use dxf_nodes, dxf_versions, etc.
+await client.create_context("drawing_001", level=ContextLevel.PROJECT)
+```
+
+---
+
 ## Database Schema
 
 | Table | Description |
 |-------|-------------|
-| `context_nodes` | Horizontal tree structure (parent_id, path, level) |
-| `context_versions` | Vertical version history (node_id, version, data) |
-| `context_branches` | Branch management |
-| `context_merges` | Merge history |
-| `context_tags` | Tags |
-| `context_kv` | KV fast query storage |
-| `context_snapshots` | System snapshots |
+| `{prefix}nodes` | Horizontal tree structure (parent_id, path, level) |
+| `{prefix}versions` | Vertical version history (node_id, version, data) |
+| `{prefix}branches` | Branch management |
+| `{prefix}merges` | Merge history |
+| `{prefix}tags` | Tags |
+| `{prefix}kv` | KV fast query storage |
+| `{prefix}snapshots` | System snapshots |
+
+*Default prefix is `context_`. Customizable via `VersionaConfig.table_prefix`.*
 
 ### Graph Extension Tables
 
@@ -500,18 +625,18 @@ See the [examples/](./examples/) directory for complete usage examples:
 
 ### Core Enhancement
 - [ ] Connection pooling optimization (pgbouncer)
-- [ ] Batch operations (`batch_set()`, `batch_commit()`)
+- [x] Batch operations (`batch_kv_set()`, `batch_commit()`, `batch_create_nodes()`)
 - [ ] CLI tool (`versiona inspect`, `versiona history`)
 - [ ] SynapseFlow integration (State-Centric Agent Framework Library)
 
 ### Advanced Features
-- [ ] Conflict resolution strategies
+- [x] Conflict resolution strategies (`detect_merge_conflicts()`, `merge_with_strategy()`)
 - [ ] Fine-grained access control
-- [ ] Auto compression & archiving
+- [x] Auto compression & archiving (`compress_versions()`, `archive_old_nodes()`, `squash_versions()`, `run_maintenance()`)
 
 ### AI-Native Features
 - [ ] Context smart summary
-- [ ] Similar context search
+- [x] Similar context search (`vg_find_similar_contexts()`, `vg_find_similar_symbols()`, `vg_find_contexts_by_structure()`)
 - [ ] Context prediction & prefetch
 
 ---

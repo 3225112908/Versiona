@@ -6,6 +6,7 @@ Features:
 2. Vertical (version): Each Context has version history
 3. Direct DB connection: Uses asyncpg, no HTTP API needed
 4. Extensible: Support additional features via extensions (e.g., Graph)
+5. Customizable: Table prefix, custom enums, custom columns
 
 Usage Example:
 
@@ -30,6 +31,42 @@ Usage Example:
         # Auto finalize and merge on exit
 
     await client.close()
+
+Custom Schema Example (for CAD, Agent, etc.):
+
+    from versiona import VersionaClient, VersionaConfig, get_schema_sql
+
+    # Define custom configuration
+    config = VersionaConfig(
+        table_prefix="dxf_",  # Tables: dxf_nodes, dxf_versions, etc.
+
+        # Custom ENUM types
+        custom_enums={
+            "entity_type": ["LINE", "CIRCLE", "ARC", "TEXT", "MTEXT"],
+            "node_type": ["file", "layer", "block", "entity"],
+        },
+
+        # Custom columns for nodes table
+        custom_node_columns={
+            "handle": "VARCHAR(20)",
+            "entity_type": "entity_type",  # Uses custom enum
+            "project_id": "UUID",
+        },
+
+        # Custom columns for versions table
+        custom_version_columns={
+            "content": "TEXT",
+            "min_x": "DOUBLE PRECISION",
+            "max_x": "DOUBLE PRECISION",
+            "binary_data": "BYTEA",
+        },
+    )
+
+    # Generate schema SQL
+    sql = get_schema_sql(config)
+
+    # Or create client with config
+    client = await VersionaClient.create(dsn, config=config)
 
 Using Graph Extension:
 
@@ -119,6 +156,7 @@ __all__ = [
 
 def _register_builtin_extensions() -> None:
     """Register built-in extensions on import."""
+    # Graph extension (generic symbol indexing & graph traversal)
     try:
         from versiona.extensions.graph.schema import get_graph_schema_sql
         from versiona.extensions.graph.functions import get_graph_functions_sql

@@ -601,6 +601,181 @@ BEGIN
     RETURN v_result;
 END;
 $$ LANGUAGE plpgsql;
+
+
+-- -----------------------------------------------------
+-- Similar Context Search (AI-Native Feature)
+-- -----------------------------------------------------
+
+-- Find similar contexts based on symbol overlap
+CREATE OR REPLACE FUNCTION vg_find_similar_contexts(
+    p_context_id TEXT,
+    p_min_similarity FLOAT DEFAULT 0.3,
+    p_limit INT DEFAULT 10
+) RETURNS TABLE (
+    context_id TEXT,
+    similarity_score FLOAT,
+    common_symbols INT,
+    common_symbol_types TEXT[]
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH source_symbols AS (
+        SELECT symbol_type, symbol_key, content_hash
+        FROM vg_symbol_index
+        WHERE context_id = p_context_id
+    ),
+    source_count AS (
+        SELECT COUNT(*)::FLOAT as cnt FROM source_symbols
+    ),
+    matches AS (
+        SELECT
+            t.context_id,
+            COUNT(*) as common_count,
+            array_agg(DISTINCT t.symbol_type) as types
+        FROM vg_symbol_index t
+        JOIN source_symbols s ON
+            t.symbol_key = s.symbol_key AND
+            t.symbol_type = s.symbol_type
+        WHERE t.context_id != p_context_id
+        GROUP BY t.context_id
+    )
+    SELECT
+        m.context_id,
+        (m.common_count / GREATEST(sc.cnt, 1))::FLOAT as similarity_score,
+        m.common_count::INT as common_symbols,
+        m.types as common_symbol_types
+    FROM matches m
+    CROSS JOIN source_count sc
+    WHERE (m.common_count / GREATEST(sc.cnt, 1)) >= p_min_similarity
+    ORDER BY similarity_score DESC
+    LIMIT p_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- Find similar symbols by content hash (exact match) or name (fuzzy)
+CREATE OR REPLACE FUNCTION vg_find_similar_symbols(
+    p_symbol_id UUID,
+    p_search_mode TEXT DEFAULT 'hybrid',  -- 'exact', 'fuzzy', 'hybrid'
+    p_limit INT DEFAULT 20
+) RETURNS TABLE (
+    id UUID,
+    context_id TEXT,
+    symbol_type TEXT,
+    symbol_key TEXT,
+    symbol_name TEXT,
+    similarity_score FLOAT,
+    match_type TEXT
+) AS $$
+DECLARE
+    v_source vg_symbol_index%ROWTYPE;
+BEGIN
+    SELECT * INTO v_source FROM vg_symbol_index WHERE vg_symbol_index.id = p_symbol_id;
+    IF v_source IS NULL THEN
+        RETURN;
+    END IF;
+
+    RETURN QUERY
+    WITH exact_matches AS (
+        SELECT
+            s.id, s.context_id, s.symbol_type, s.symbol_key, s.symbol_name,
+            1.0::FLOAT as score,
+            'exact'::TEXT as mtype
+        FROM vg_symbol_index s
+        WHERE s.id != p_symbol_id
+          AND s.content_hash = v_source.content_hash
+          AND s.content_hash IS NOT NULL
+          AND (p_search_mode IN ('exact', 'hybrid'))
+    ),
+    fuzzy_matches AS (
+        SELECT
+            s.id, s.context_id, s.symbol_type, s.symbol_key, s.symbol_name,
+            GREATEST(
+                similarity(s.symbol_name, v_source.symbol_name),
+                similarity(s.symbol_key, v_source.symbol_key)
+            )::FLOAT as score,
+            'fuzzy'::TEXT as mtype
+        FROM vg_symbol_index s
+        WHERE s.id != p_symbol_id
+          AND s.symbol_type = v_source.symbol_type
+          AND (p_search_mode IN ('fuzzy', 'hybrid'))
+          AND (
+              s.symbol_name % v_source.symbol_name OR
+              s.symbol_key % v_source.symbol_key
+          )
+    ),
+    all_matches AS (
+        SELECT * FROM exact_matches
+        UNION ALL
+        SELECT * FROM fuzzy_matches
+    )
+    SELECT DISTINCT ON (am.id)
+        am.id, am.context_id, am.symbol_type, am.symbol_key, am.symbol_name,
+        am.score, am.mtype
+    FROM all_matches am
+    ORDER BY am.id, am.score DESC
+    LIMIT p_limit;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- Find contexts with similar structure (by edge patterns)
+CREATE OR REPLACE FUNCTION vg_find_contexts_by_structure(
+    p_context_id TEXT,
+    p_min_similarity FLOAT DEFAULT 0.5,
+    p_limit INT DEFAULT 10
+) RETURNS TABLE (
+    context_id TEXT,
+    structural_similarity FLOAT,
+    edge_pattern_matches INT
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH source_patterns AS (
+        -- Get edge type distribution for source context
+        SELECT
+            e.edge_type,
+            COUNT(*) as cnt
+        FROM vg_symbol_edges e
+        JOIN vg_symbol_index s ON e.source_id = s.id
+        WHERE s.context_id = p_context_id
+        GROUP BY e.edge_type
+    ),
+    source_total AS (
+        SELECT COALESCE(SUM(cnt), 1)::FLOAT as total FROM source_patterns
+    ),
+    target_patterns AS (
+        -- Get edge type distribution for all other contexts
+        SELECT
+            s.context_id,
+            e.edge_type,
+            COUNT(*) as cnt
+        FROM vg_symbol_edges e
+        JOIN vg_symbol_index s ON e.source_id = s.id
+        WHERE s.context_id != p_context_id
+        GROUP BY s.context_id, e.edge_type
+    ),
+    pattern_comparison AS (
+        SELECT
+            tp.context_id,
+            SUM(LEAST(sp.cnt, tp.cnt)) as matched,
+            SUM(tp.cnt) as total_target
+        FROM target_patterns tp
+        JOIN source_patterns sp ON tp.edge_type = sp.edge_type
+        GROUP BY tp.context_id
+    )
+    SELECT
+        pc.context_id,
+        (pc.matched / GREATEST(st.total, pc.total_target))::FLOAT as structural_similarity,
+        pc.matched::INT as edge_pattern_matches
+    FROM pattern_comparison pc
+    CROSS JOIN source_total st
+    WHERE (pc.matched / GREATEST(st.total, pc.total_target)) >= p_min_similarity
+    ORDER BY structural_similarity DESC
+    LIMIT p_limit;
+END;
+$$ LANGUAGE plpgsql;
 """
 
 
@@ -760,6 +935,10 @@ def get_graph_function_names(include_feedback: bool = False) -> list[str]:
         "vg_cleanup_expired_views",
         "vg_cleanup_orphan_symbols",
         "vg_get_stats",
+        # Similar context search (AI-Native Feature)
+        "vg_find_similar_contexts",
+        "vg_find_similar_symbols",
+        "vg_find_contexts_by_structure",
     ]
     if include_feedback:
         functions.extend([

@@ -1009,51 +1009,712 @@ CREATE TRIGGER tr_context_branches_updated_at
 
 
 # ============================================================
+# Batch Operations (Roadmap Feature)
+# ============================================================
+
+BATCH_FUNCTIONS_SQL = """
+-- ============================================================
+-- Batch Set KV
+-- ============================================================
+-- Efficiently set multiple key-value pairs in one transaction
+
+CREATE OR REPLACE FUNCTION batch_kv_set(
+    p_node_id TEXT,
+    p_items JSONB,  -- [{"key": "...", "value": {...}, "category": "local", "ttl_seconds": null, "ttl_turns": null}, ...]
+    p_current_turn INT DEFAULT NULL
+) RETURNS INT AS $$
+DECLARE
+    v_item JSONB;
+    v_count INT := 0;
+    v_version INT;
+    v_expires_at TIMESTAMPTZ;
+    v_expires_at_turn INT;
+BEGIN
+    SELECT current_version INTO v_version FROM context_nodes WHERE id = p_node_id;
+    IF v_version IS NULL THEN
+        RAISE EXCEPTION 'Node not found: %', p_node_id;
+    END IF;
+
+    FOR v_item IN SELECT * FROM jsonb_array_elements(p_items)
+    LOOP
+        -- Calculate TTL
+        v_expires_at := NULL;
+        v_expires_at_turn := NULL;
+
+        IF (v_item->>'ttl_seconds')::INT IS NOT NULL THEN
+            v_expires_at := now() + ((v_item->>'ttl_seconds') || ' seconds')::INTERVAL;
+        END IF;
+
+        IF (v_item->>'ttl_turns')::INT IS NOT NULL AND p_current_turn IS NOT NULL THEN
+            v_expires_at_turn := p_current_turn + (v_item->>'ttl_turns')::INT;
+        END IF;
+
+        INSERT INTO context_kv (
+            node_id, key, value, category, version,
+            ttl_seconds, expires_at, ttl_turns, created_at_turn, expires_at_turn
+        )
+        VALUES (
+            p_node_id,
+            v_item->>'key',
+            v_item->'value',
+            COALESCE(v_item->>'category', 'local'),
+            v_version,
+            (v_item->>'ttl_seconds')::INT,
+            v_expires_at,
+            (v_item->>'ttl_turns')::INT,
+            p_current_turn,
+            v_expires_at_turn
+        )
+        ON CONFLICT (node_id, key) DO UPDATE SET
+            value = EXCLUDED.value,
+            category = EXCLUDED.category,
+            version = EXCLUDED.version,
+            ttl_seconds = EXCLUDED.ttl_seconds,
+            expires_at = EXCLUDED.expires_at,
+            ttl_turns = EXCLUDED.ttl_turns,
+            created_at_turn = EXCLUDED.created_at_turn,
+            expires_at_turn = EXCLUDED.expires_at_turn,
+            is_soft_deleted = false,
+            updated_at = now();
+
+        v_count := v_count + 1;
+    END LOOP;
+
+    RETURN v_count;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ============================================================
+-- Batch Commit (commit multiple nodes in one transaction)
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION batch_commit(
+    p_items JSONB,  -- [{"node_id": "...", "local_data": {...}, "output_data": {...}, "message": "..."}, ...]
+    p_author_id TEXT DEFAULT NULL
+) RETURNS TABLE (node_id TEXT, new_version INT) AS $$
+DECLARE
+    v_item JSONB;
+    v_node_id TEXT;
+    v_new_version INT;
+BEGIN
+    FOR v_item IN SELECT * FROM jsonb_array_elements(p_items)
+    LOOP
+        v_node_id := v_item->>'node_id';
+
+        -- Use existing commit_context function
+        v_new_version := commit_context(
+            v_node_id,
+            v_item->'local_data',
+            v_item->'output_data',
+            NULL,  -- soft_deleted_keys
+            v_item->>'message',
+            p_author_id
+        );
+
+        node_id := v_node_id;
+        new_version := v_new_version;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ============================================================
+-- Batch Create Nodes
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION batch_create_nodes(
+    p_nodes JSONB  -- [{"id": "...", "parent_id": "...", "level": "L1", "name": "...", "metadata": {...}}, ...]
+) RETURNS INT AS $$
+DECLARE
+    v_node JSONB;
+    v_count INT := 0;
+    v_parent_path LTREE;
+    v_path LTREE;
+BEGIN
+    FOR v_node IN SELECT * FROM jsonb_array_elements(p_nodes)
+    LOOP
+        -- Calculate path
+        IF v_node->>'parent_id' IS NOT NULL THEN
+            SELECT path INTO v_parent_path FROM context_nodes WHERE id = v_node->>'parent_id';
+            IF v_parent_path IS NULL THEN
+                CONTINUE;  -- Skip if parent not found
+            END IF;
+            v_path := v_parent_path || (v_node->>'id')::ltree;
+        ELSE
+            v_path := (v_node->>'id')::ltree;
+        END IF;
+
+        INSERT INTO context_nodes (id, parent_id, level, path, name, metadata, current_version)
+        VALUES (
+            v_node->>'id',
+            v_node->>'parent_id',
+            COALESCE(v_node->>'level', 'L1'),
+            v_path,
+            v_node->>'name',
+            COALESCE(v_node->'metadata', '{}'),
+            0
+        )
+        ON CONFLICT (id) DO NOTHING;
+
+        v_count := v_count + 1;
+    END LOOP;
+
+    RETURN v_count;
+END;
+$$ LANGUAGE plpgsql;
+"""
+
+
+# ============================================================
+# Conflict Resolution (Roadmap Feature)
+# ============================================================
+
+CONFLICT_FUNCTIONS_SQL = """
+-- ============================================================
+-- Conflict Info Type
+-- ============================================================
+
+DO $$ BEGIN
+    CREATE TYPE conflict_info AS (
+        key TEXT,
+        source_value JSONB,
+        target_value JSONB,
+        conflict_type TEXT  -- 'key_conflict', 'delete_conflict'
+    );
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
+
+-- ============================================================
+-- Detect Conflicts Before Merge
+-- ============================================================
+
+CREATE OR REPLACE FUNCTION detect_merge_conflicts(
+    p_source_id TEXT,
+    p_target_id TEXT
+) RETURNS SETOF conflict_info AS $$
+DECLARE
+    v_source_node context_nodes%ROWTYPE;
+    v_target_node context_nodes%ROWTYPE;
+    v_source_ver context_versions%ROWTYPE;
+    v_target_ver context_versions%ROWTYPE;
+    v_key TEXT;
+    v_conflict conflict_info;
+BEGIN
+    SELECT * INTO v_source_node FROM context_nodes WHERE id = p_source_id;
+    SELECT * INTO v_target_node FROM context_nodes WHERE id = p_target_id;
+
+    IF v_source_node IS NULL OR v_target_node IS NULL THEN
+        RETURN;
+    END IF;
+
+    SELECT * INTO v_source_ver FROM context_versions
+        WHERE node_id = p_source_id AND version = v_source_node.current_version;
+    SELECT * INTO v_target_ver FROM context_versions
+        WHERE node_id = p_target_id AND version = v_target_node.current_version;
+
+    -- Check output_data conflicts
+    FOR v_key IN SELECT jsonb_object_keys(v_source_ver.output_data)
+    LOOP
+        IF v_target_ver.output_data ? v_key THEN
+            IF v_source_ver.output_data->v_key IS DISTINCT FROM v_target_ver.output_data->v_key THEN
+                v_conflict.key := v_key;
+                v_conflict.source_value := v_source_ver.output_data->v_key;
+                v_conflict.target_value := v_target_ver.output_data->v_key;
+                v_conflict.conflict_type := 'key_conflict';
+                RETURN NEXT v_conflict;
+            END IF;
+        END IF;
+    END LOOP;
+
+    -- Check soft delete conflicts
+    IF v_source_ver.soft_deleted_keys IS NOT NULL THEN
+        FOREACH v_key IN ARRAY v_source_ver.soft_deleted_keys
+        LOOP
+            IF v_target_ver.output_data ? v_key THEN
+                v_conflict.key := v_key;
+                v_conflict.source_value := NULL;
+                v_conflict.target_value := v_target_ver.output_data->v_key;
+                v_conflict.conflict_type := 'delete_conflict';
+                RETURN NEXT v_conflict;
+            END IF;
+        END LOOP;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ============================================================
+-- Merge with Conflict Resolution Strategy
+-- ============================================================
+-- Strategies:
+--   'source_wins': Source overwrites target on conflict
+--   'target_wins': Target keeps its value on conflict
+--   'merge_deep': Deep merge objects (source keys added to target objects)
+--   'manual': Use p_resolutions to specify per-key resolution
+
+CREATE OR REPLACE FUNCTION merge_with_strategy(
+    p_source_id TEXT,
+    p_target_id TEXT,
+    p_strategy TEXT DEFAULT 'source_wins',
+    p_resolutions JSONB DEFAULT NULL,  -- {"key1": "source", "key2": "target", "key3": {...custom_value...}}
+    p_message TEXT DEFAULT NULL
+) RETURNS INT AS $$
+DECLARE
+    v_source_node context_nodes%ROWTYPE;
+    v_target_node context_nodes%ROWTYPE;
+    v_source_ver context_versions%ROWTYPE;
+    v_target_ver context_versions%ROWTYPE;
+    v_merged_output JSONB;
+    v_key TEXT;
+    v_resolution TEXT;
+    v_new_version INT;
+BEGIN
+    SELECT * INTO v_source_node FROM context_nodes WHERE id = p_source_id;
+    SELECT * INTO v_target_node FROM context_nodes WHERE id = p_target_id;
+
+    IF v_source_node IS NULL THEN
+        RAISE EXCEPTION 'Source node not found: %', p_source_id;
+    END IF;
+    IF v_target_node IS NULL THEN
+        RAISE EXCEPTION 'Target node not found: %', p_target_id;
+    END IF;
+
+    SELECT * INTO v_source_ver FROM context_versions
+        WHERE node_id = p_source_id AND version = v_source_node.current_version;
+    SELECT * INTO v_target_ver FROM context_versions
+        WHERE node_id = p_target_id AND version = v_target_node.current_version;
+
+    -- Start with target's output
+    v_merged_output := COALESCE(v_target_ver.output_data, '{}');
+
+    -- Merge source's output based on strategy
+    FOR v_key IN SELECT jsonb_object_keys(v_source_ver.output_data)
+    LOOP
+        IF p_strategy = 'source_wins' THEN
+            v_merged_output := v_merged_output || jsonb_build_object(v_key, v_source_ver.output_data->v_key);
+
+        ELSIF p_strategy = 'target_wins' THEN
+            IF NOT v_merged_output ? v_key THEN
+                v_merged_output := v_merged_output || jsonb_build_object(v_key, v_source_ver.output_data->v_key);
+            END IF;
+
+        ELSIF p_strategy = 'merge_deep' THEN
+            IF v_merged_output ? v_key
+               AND jsonb_typeof(v_merged_output->v_key) = 'object'
+               AND jsonb_typeof(v_source_ver.output_data->v_key) = 'object' THEN
+                -- Deep merge objects
+                v_merged_output := jsonb_set(
+                    v_merged_output,
+                    ARRAY[v_key],
+                    v_merged_output->v_key || v_source_ver.output_data->v_key
+                );
+            ELSE
+                v_merged_output := v_merged_output || jsonb_build_object(v_key, v_source_ver.output_data->v_key);
+            END IF;
+
+        ELSIF p_strategy = 'manual' AND p_resolutions IS NOT NULL THEN
+            IF p_resolutions ? v_key THEN
+                v_resolution := p_resolutions->>v_key;
+                IF v_resolution = 'source' THEN
+                    v_merged_output := v_merged_output || jsonb_build_object(v_key, v_source_ver.output_data->v_key);
+                ELSIF v_resolution = 'target' THEN
+                    NULL;  -- Keep target value (already in v_merged_output)
+                ELSE
+                    -- Custom value provided
+                    v_merged_output := v_merged_output || jsonb_build_object(v_key, p_resolutions->v_key);
+                END IF;
+            ELSE
+                -- No resolution specified, use source_wins as default
+                v_merged_output := v_merged_output || jsonb_build_object(v_key, v_source_ver.output_data->v_key);
+            END IF;
+        END IF;
+    END LOOP;
+
+    -- Create new version with merged data
+    v_new_version := commit_context(
+        p_target_id,
+        NULL,  -- local_data
+        v_merged_output,
+        NULL,  -- soft_deleted_keys
+        COALESCE(p_message, 'Merged from ' || p_source_id || ' with strategy: ' || p_strategy),
+        NULL
+    );
+
+    -- Record merge history
+    INSERT INTO context_merges (
+        source_node_id, source_version,
+        target_node_id, target_version_before, target_version_after,
+        merge_type, conflict_resolution, message
+    ) VALUES (
+        p_source_id, v_source_node.current_version,
+        p_target_id, v_target_node.current_version, v_new_version,
+        p_strategy,
+        p_resolutions,
+        p_message
+    );
+
+    RETURN v_new_version;
+END;
+$$ LANGUAGE plpgsql;
+"""
+
+
+# ============================================================
+# Auto Compression & Archiving (Roadmap Feature)
+# ============================================================
+
+COMPRESSION_FUNCTIONS_SQL = """
+-- ============================================================
+-- Archive Tables (created on first use)
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS context_nodes_archive (
+    LIKE context_nodes INCLUDING ALL,
+    archived_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS context_versions_archive (
+    LIKE context_versions INCLUDING ALL,
+    archived_at TIMESTAMPTZ DEFAULT now()
+);
+
+
+-- ============================================================
+-- Compress Old Versions (keep every Nth version)
+-- ============================================================
+-- For long-lived contexts with many versions, compress by keeping only every Nth version
+
+CREATE OR REPLACE FUNCTION compress_versions(
+    p_node_id TEXT,
+    p_keep_every INT DEFAULT 10,        -- Keep every 10th version
+    p_keep_recent INT DEFAULT 5,        -- Always keep last 5 versions
+    p_dry_run BOOLEAN DEFAULT TRUE      -- Preview only, don't delete
+) RETURNS TABLE (
+    version_num INT,
+    created_at TIMESTAMPTZ,
+    will_delete BOOLEAN
+) AS $$
+DECLARE
+    v_node context_nodes%ROWTYPE;
+    v_min_keep_version INT;
+    v_deleted INT := 0;
+BEGIN
+    SELECT * INTO v_node FROM context_nodes WHERE id = p_node_id;
+    IF v_node IS NULL THEN
+        RAISE EXCEPTION 'Node not found: %', p_node_id;
+    END IF;
+
+    v_min_keep_version := GREATEST(1, v_node.current_version - p_keep_recent);
+
+    RETURN QUERY
+    SELECT
+        v.version,
+        v.created_at,
+        (v.version < v_min_keep_version AND v.version % p_keep_every != 0) AS will_delete
+    FROM context_versions v
+    WHERE v.node_id = p_node_id
+    ORDER BY v.version;
+
+    IF NOT p_dry_run THEN
+        DELETE FROM context_versions
+        WHERE node_id = p_node_id
+          AND version < v_min_keep_version
+          AND version % p_keep_every != 0;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ============================================================
+-- Archive Old Nodes (move to archive table)
+-- ============================================================
+-- Move old/archived nodes to archive tables to reduce main table size
+
+CREATE OR REPLACE FUNCTION archive_old_nodes(
+    p_older_than_days INT DEFAULT 90,
+    p_status TEXT DEFAULT 'archived'
+) RETURNS INT AS $$
+DECLARE
+    v_cutoff TIMESTAMPTZ;
+    v_count INT := 0;
+    v_node RECORD;
+BEGIN
+    v_cutoff := now() - (p_older_than_days || ' days')::INTERVAL;
+
+    FOR v_node IN
+        SELECT id FROM context_nodes
+        WHERE status = p_status AND updated_at < v_cutoff
+    LOOP
+        -- Archive versions first
+        INSERT INTO context_versions_archive
+        SELECT *, now() FROM context_versions WHERE node_id = v_node.id;
+
+        -- Archive node
+        INSERT INTO context_nodes_archive
+        SELECT *, now() FROM context_nodes WHERE id = v_node.id;
+
+        -- Delete from main tables (cascades to versions, kv, branches)
+        DELETE FROM context_nodes WHERE id = v_node.id;
+
+        v_count := v_count + 1;
+    END LOOP;
+
+    RETURN v_count;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ============================================================
+-- Squash Versions (combine multiple versions into one)
+-- ============================================================
+-- Useful for cleaning up intermediate versions
+
+CREATE OR REPLACE FUNCTION squash_versions(
+    p_node_id TEXT,
+    p_from_version INT,
+    p_to_version INT,
+    p_message TEXT DEFAULT 'Squashed versions'
+) RETURNS INT AS $$
+DECLARE
+    v_node context_nodes%ROWTYPE;
+    v_final_ver context_versions%ROWTYPE;
+BEGIN
+    SELECT * INTO v_node FROM context_nodes WHERE id = p_node_id;
+    IF v_node IS NULL THEN
+        RAISE EXCEPTION 'Node not found: %', p_node_id;
+    END IF;
+
+    IF p_to_version > v_node.current_version THEN
+        RAISE EXCEPTION 'Cannot squash beyond current version %', v_node.current_version;
+    END IF;
+
+    IF p_from_version >= p_to_version THEN
+        RAISE EXCEPTION 'from_version must be less than to_version';
+    END IF;
+
+    -- Get final state at p_to_version
+    SELECT * INTO v_final_ver FROM context_versions
+        WHERE node_id = p_node_id AND version = p_to_version;
+
+    -- Delete versions in range (except to_version)
+    DELETE FROM context_versions
+    WHERE node_id = p_node_id
+      AND version >= p_from_version
+      AND version < p_to_version;
+
+    -- Update the remaining version's message
+    UPDATE context_versions
+    SET message = p_message || ' (squashed v' || p_from_version || '-v' || p_to_version || ')'
+    WHERE node_id = p_node_id AND version = p_to_version;
+
+    RETURN p_to_version;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ============================================================
+-- Auto Maintenance Job (run periodically)
+-- ============================================================
+-- Combines cleanup, compression, and archiving
+
+CREATE OR REPLACE FUNCTION run_maintenance(
+    p_compress_keep_every INT DEFAULT 10,
+    p_archive_older_than_days INT DEFAULT 90,
+    p_current_turn INT DEFAULT NULL
+) RETURNS TABLE (
+    compressed_nodes INT,
+    archived_nodes INT,
+    expired_kv INT
+) AS $$
+DECLARE
+    v_compressed INT := 0;
+    v_archived INT;
+    v_expired INT;
+    v_node RECORD;
+BEGIN
+    -- Compress versions for nodes with > 50 versions
+    FOR v_node IN
+        SELECT node_id, COUNT(*) as ver_count
+        FROM context_versions
+        GROUP BY node_id
+        HAVING COUNT(*) > 50
+    LOOP
+        PERFORM compress_versions(v_node.node_id, p_compress_keep_every, 5, FALSE);
+        v_compressed := v_compressed + 1;
+    END LOOP;
+
+    -- Archive old nodes
+    v_archived := archive_old_nodes(p_archive_older_than_days, 'archived');
+
+    -- Cleanup expired KV
+    v_expired := cleanup_expired(p_current_turn);
+
+    compressed_nodes := v_compressed;
+    archived_nodes := v_archived;
+    expired_kv := v_expired;
+    RETURN NEXT;
+END;
+$$ LANGUAGE plpgsql;
+"""
+
+
+# ============================================================
 # Helper Functions
 # ============================================================
 
-def get_functions_sql() -> str:
-    """Get SQL for all functions."""
-    return "\n".join([
+def _apply_prefix(sql: str, prefix: str) -> str:
+    """
+    Apply table prefix to SQL by replacing 'context_' with the given prefix.
+
+    This also updates function names to use the prefix.
+    For example, if prefix is 'dxf_':
+    - context_nodes -> dxf_nodes
+    - create_context_node -> create_dxf_node
+    - fork_context -> fork_dxf
+    """
+    if prefix == "context_":
+        return sql
+
+    # Replace table names
+    result = sql.replace("context_nodes", f"{prefix}nodes")
+    result = result.replace("context_versions", f"{prefix}versions")
+    result = result.replace("context_branches", f"{prefix}branches")
+    result = result.replace("context_merges", f"{prefix}merges")
+    result = result.replace("context_tags", f"{prefix}tags")
+    result = result.replace("context_kv", f"{prefix}kv")
+    result = result.replace("context_snapshots", f"{prefix}snapshots")
+
+    # Replace function names (be careful with order - longer matches first)
+    result = result.replace("create_context_node", f"create_{prefix}node")
+    result = result.replace("fork_context", f"fork_{prefix[:-1]}")  # Remove trailing _
+    result = result.replace("fork_session", f"fork_{prefix}session")
+    result = result.replace("commit_context", f"commit_{prefix[:-1]}")
+    result = result.replace("get_context", f"get_{prefix[:-1]}")
+    result = result.replace("merge_context", f"merge_{prefix[:-1]}")
+    result = result.replace("diff_versions", f"{prefix}diff_versions")
+    result = result.replace("checkout_version", f"{prefix}checkout_version")
+    result = result.replace("get_version_history", f"{prefix}get_version_history")
+    result = result.replace("get_inherited_output", f"{prefix}get_inherited_output")
+    result = result.replace("get_children", f"{prefix}get_children")
+
+    # KV functions
+    result = result.replace("kv_set", f"{prefix}kv_set")
+    result = result.replace("kv_get", f"{prefix}kv_get")
+    result = result.replace("kv_get_all", f"{prefix}kv_get_all")
+    result = result.replace("kv_soft_delete", f"{prefix}kv_soft_delete")
+    result = result.replace("kv_expire_by_turn", f"{prefix}kv_expire_by_turn")
+    result = result.replace("cleanup_expired", f"{prefix}cleanup_expired")
+
+    # Snapshot functions
+    result = result.replace("create_snapshot", f"{prefix}create_snapshot")
+    result = result.replace("restore_snapshot", f"{prefix}restore_snapshot")
+    result = result.replace("list_snapshots", f"{prefix}list_snapshots")
+    result = result.replace("get_snapshot", f"{prefix}get_snapshot")
+    result = result.replace("delete_snapshot", f"{prefix}delete_snapshot")
+
+    # Batch functions
+    result = result.replace("batch_kv_set", f"{prefix}batch_kv_set")
+    result = result.replace("batch_commit", f"{prefix}batch_commit")
+    result = result.replace("batch_create_nodes", f"{prefix}batch_create_nodes")
+
+    # Conflict functions
+    result = result.replace("detect_merge_conflicts", f"{prefix}detect_merge_conflicts")
+    result = result.replace("merge_with_strategy", f"{prefix}merge_with_strategy")
+
+    # Compression functions
+    result = result.replace("compress_versions", f"{prefix}compress_versions")
+    result = result.replace("archive_old_nodes", f"{prefix}archive_old_nodes")
+    result = result.replace("squash_versions", f"{prefix}squash_versions")
+    result = result.replace("run_maintenance", f"{prefix}run_maintenance")
+
+    # Triggers
+    result = result.replace("update_updated_at", f"{prefix}update_updated_at")
+    result = result.replace("tr_context_", f"tr_{prefix}")
+
+    return result
+
+
+def get_functions_sql(prefix: str = "context_") -> str:
+    """
+    Get SQL for all functions.
+
+    Args:
+        prefix: Table/function prefix (default: "context_")
+
+    Returns:
+        SQL string with all functions using the specified prefix.
+    """
+    base_sql = "\n".join([
         NODE_FUNCTIONS_SQL,
         VERSION_FUNCTIONS_SQL,
         MERGE_FUNCTIONS_SQL,
         KV_FUNCTIONS_SQL,
         SNAPSHOT_FUNCTIONS_SQL,
         TRIGGERS_SQL,
+        # Roadmap features
+        BATCH_FUNCTIONS_SQL,
+        CONFLICT_FUNCTIONS_SQL,
+        COMPRESSION_FUNCTIONS_SQL,
     ])
+    return _apply_prefix(base_sql, prefix)
 
 
-def get_function_names() -> list[str]:
-    """Get all function names."""
-    return [
+def get_function_names(prefix: str = "context_") -> list[str]:
+    """
+    Get all function names with the specified prefix.
+
+    Args:
+        prefix: Function prefix (default: "context_")
+
+    Returns:
+        List of function names.
+    """
+    # Base function names (without prefix for simplicity)
+    base_names = [
         # Node operations
-        "create_context_node",
-        "fork_context",
-        "fork_session",
-        "get_children",
+        f"create_{prefix}node",
+        f"fork_{prefix[:-1]}",  # fork_context -> fork_dxf
+        f"fork_{prefix}session",
+        f"{prefix}get_children",
         # Version operations
-        "commit_context",
-        "get_context",
-        "get_inherited_output",
-        "diff_versions",
-        "checkout_version",
-        "get_version_history",
+        f"commit_{prefix[:-1]}",
+        f"get_{prefix[:-1]}",
+        f"{prefix}get_inherited_output",
+        f"{prefix}diff_versions",
+        f"{prefix}checkout_version",
+        f"{prefix}get_version_history",
         # Merge operations
-        "merge_context",
+        f"merge_{prefix[:-1]}",
         # KV operations (with dual-mode TTL)
-        "kv_set",
-        "kv_get",
-        "kv_get_all",
-        "kv_soft_delete",
-        "kv_expire_by_turn",
-        "cleanup_expired",
+        f"{prefix}kv_set",
+        f"{prefix}kv_get",
+        f"{prefix}kv_get_all",
+        f"{prefix}kv_soft_delete",
+        f"{prefix}kv_expire_by_turn",
+        f"{prefix}cleanup_expired",
         # Snapshot operations
-        "create_snapshot",
-        "restore_snapshot",
-        "list_snapshots",
-        "get_snapshot",
-        "delete_snapshot",
+        f"{prefix}create_snapshot",
+        f"{prefix}restore_snapshot",
+        f"{prefix}list_snapshots",
+        f"{prefix}get_snapshot",
+        f"{prefix}delete_snapshot",
         # Triggers
-        "update_updated_at",
+        f"{prefix}update_updated_at",
+        # Batch operations (Roadmap)
+        f"{prefix}batch_kv_set",
+        f"{prefix}batch_commit",
+        f"{prefix}batch_create_nodes",
+        # Conflict resolution (Roadmap)
+        f"{prefix}detect_merge_conflicts",
+        f"{prefix}merge_with_strategy",
+        # Compression & archiving (Roadmap)
+        f"{prefix}compress_versions",
+        f"{prefix}archive_old_nodes",
+        f"{prefix}squash_versions",
+        f"{prefix}run_maintenance",
     ]
+
+    return base_names
