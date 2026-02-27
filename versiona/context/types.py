@@ -213,6 +213,32 @@ class VersionaConfig:
     exclude_version_columns: set[str] = field(default_factory=set)
 
     # ============================================================
+    # Content Storage Mode
+    # ============================================================
+
+    # Content storage mode:
+    # - "kv": Use KV table for content (default, suitable for Agent scenarios)
+    #         Content is stored in {prefix}kv table with key-value pairs.
+    #         Supports TTL (time/turn expiration), soft delete, etc.
+    #
+    # - "inline": Store content directly in nodes table (suitable for CAD/DXF)
+    #             Content is stored in custom columns on nodes table.
+    #             More efficient for bulk reads (no JOIN needed).
+    #             Version snapshots are manual (user/agent triggered).
+    #
+    # When using "inline" mode:
+    # 1. Add content columns to custom_node_columns
+    # 2. Use client.update_node_content() for updates
+    # 3. Use client.get_node_content() for reads
+    # 4. Versions are created via client.create_snapshot() or client.commit()
+    content_storage_mode: str = "kv"
+
+    # For inline mode: columns to include when creating version snapshots
+    # These columns will be copied from nodes to versions when snapshotting
+    # Example: ["content", "min_x", "min_y", "max_x", "max_y"]
+    snapshot_columns: list[str] = field(default_factory=list)
+
+    # ============================================================
     # Auto cleanup settings
     # ============================================================
     auto_cleanup: bool = True

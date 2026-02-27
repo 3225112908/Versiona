@@ -92,6 +92,7 @@ class VersionaClient:
     async def create(
         cls,
         dsn: str | None = None,
+        config: VersionaConfig | None = None,
         **kwargs: Any,
     ) -> "VersionaClient":
         """
@@ -99,12 +100,33 @@ class VersionaClient:
 
         Args:
             dsn: PostgreSQL connection string
-            **kwargs: Other configuration parameters
+            config: Pre-built VersionaConfig object (takes precedence over dsn/kwargs)
+            **kwargs: Other configuration parameters (ignored if config is provided)
 
         Returns:
             Connected client
+
+        Examples:
+            # Simple usage with DSN
+            client = await VersionaClient.create("postgresql://localhost/db")
+
+            # With pre-built config (recommended for custom schemas)
+            config = VersionaConfig(
+                dsn="postgresql://localhost/db",
+                table_prefix="dxf_",
+                content_storage_mode="inline",
+                custom_node_columns={"content": "TEXT"},
+            )
+            client = await VersionaClient.create(config=config)
         """
-        config = VersionaConfig(dsn=dsn, **kwargs) if dsn else VersionaConfig(**kwargs)
+        if config is not None:
+            # Use provided config directly
+            pass
+        elif dsn:
+            config = VersionaConfig(dsn=dsn, **kwargs)
+        else:
+            config = VersionaConfig(**kwargs)
+
         client = cls(config)
         await client.connect()
         return client
@@ -167,17 +189,34 @@ class VersionaClient:
         """
         Initialize the database schema.
 
+        Uses the client's config (table_prefix, custom columns, etc.) to generate schema.
+
         Args:
             extensions: List of extensions to load (e.g., ["graph"])
             extension_options: Options for each extension
                 e.g., {"graph": {"include_feedback": True}}
         """
-        from versiona.db.schema import get_full_schema_with_extensions
+        from versiona.db.schema import get_schema_sql, get_extension_schema, get_extension_functions
 
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                get_full_schema_with_extensions(extensions, extension_options)
-            )
+            # Create core schema with config
+            core_sql = get_schema_sql(self.config)
+            await conn.execute(core_sql)
+
+            # Load extensions if specified
+            if extensions:
+                extension_options = extension_options or {}
+                for ext_name in extensions:
+                    opts = extension_options.get(ext_name, {})
+                    # Pass table prefix to extensions
+                    opts.setdefault("table_prefix", self.config.table_prefix)
+
+                    schema_sql = get_extension_schema(ext_name, **opts)
+                    await conn.execute(schema_sql)
+
+                    functions_sql = get_extension_functions(ext_name, **opts)
+                    if functions_sql:
+                        await conn.execute(functions_sql)
 
     async def init_extension(
         self,
@@ -1496,6 +1535,194 @@ class VersionaClient:
                 copy_kv,
             )
             return result
+
+    # =========================================================================
+    # Direct Node Content Operations (for inline content mode)
+    # =========================================================================
+
+    async def update_node_content(
+        self,
+        context_id: str,
+        content: str | None = None,
+        **custom_columns: Any,
+    ) -> bool:
+        """
+        直接更新 node 的自訂欄位（不創建版本）。
+
+        適用場景：
+        - DXF entity 內容更新
+        - 任何需要直接存在 node 上的資料（而非 KV 表）
+
+        Args:
+            context_id: Node ID
+            content: Content to update (if node has 'content' column)
+            **custom_columns: Other custom columns to update
+                (e.g., min_x=0, max_x=100, color_override=7)
+
+        Returns:
+            Whether update was successful
+
+        Example:
+            await client.update_node_content(
+                entity_id,
+                content=yaml_content,
+                min_x=0, max_x=100,
+                min_y=0, max_y=50,
+            )
+        """
+        columns = []
+        values = [context_id]
+        idx = 2
+
+        if content is not None:
+            columns.append(f"content = ${idx}")
+            values.append(content)
+            idx += 1
+
+        for col, val in custom_columns.items():
+            columns.append(f"{col} = ${idx}")
+            values.append(val)
+            idx += 1
+
+        if not columns:
+            return False
+
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(f"""
+                UPDATE {self.config.nodes_table}
+                SET {", ".join(columns)}, updated_at = NOW()
+                WHERE id = $1
+            """, *values)
+
+        return "UPDATE 1" in result
+
+    async def update_nodes_content_batch(
+        self,
+        updates: list[dict[str, Any]],
+    ) -> int:
+        """
+        批量更新多個 node 的內容（使用事務）。
+
+        Args:
+            updates: List of dicts with "id" and custom columns
+                [{"id": "node1", "content": "...", "min_x": 0}, ...]
+
+        Returns:
+            Number of updated nodes
+
+        Example:
+            await client.update_nodes_content_batch([
+                {"id": id1, "content": content1, "min_x": 0, "max_x": 100},
+                {"id": id2, "content": content2, "min_x": 50, "max_x": 150},
+            ])
+        """
+        if not updates:
+            return 0
+
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                updated = 0
+                for u in updates:
+                    u = dict(u)  # Copy to avoid modifying original
+                    node_id = u.pop("id")
+                    columns = []
+                    values = [node_id]
+                    idx = 2
+
+                    for col, val in u.items():
+                        columns.append(f"{col} = ${idx}")
+                        values.append(val)
+                        idx += 1
+
+                    if columns:
+                        result = await conn.execute(f"""
+                            UPDATE {self.config.nodes_table}
+                            SET {", ".join(columns)}, updated_at = NOW()
+                            WHERE id = $1
+                        """, *values)
+                        if "UPDATE 1" in result:
+                            updated += 1
+
+        return updated
+
+    async def get_node_content(
+        self,
+        context_id: str,
+        columns: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        直接讀取 node 的自訂欄位。
+
+        Args:
+            context_id: Node ID
+            columns: Columns to fetch (default: all custom columns from config)
+
+        Returns:
+            Dict of column values, or None if node not found
+
+        Example:
+            data = await client.get_node_content(entity_id, ["content", "min_x", "max_x"])
+            # Returns: {"content": "...", "min_x": 0, "max_x": 100}
+        """
+        cols = columns or list(self.config.custom_node_columns.keys())
+        if not cols:
+            return None
+
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(f"""
+                SELECT {", ".join(cols)}
+                FROM {self.config.nodes_table}
+                WHERE id = $1
+            """, context_id)
+
+        return dict(row) if row else None
+
+    async def get_nodes_content_batch(
+        self,
+        context_ids: list[str],
+        columns: list[str] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """
+        批量讀取多個 node 的自訂欄位。
+
+        Args:
+            context_ids: List of node IDs
+            columns: Columns to fetch (default: all custom columns from config)
+
+        Returns:
+            Dict mapping node_id -> column values
+
+        Example:
+            data = await client.get_nodes_content_batch(
+                [id1, id2, id3],
+                ["content", "min_x", "max_x"]
+            )
+            # Returns: {id1: {...}, id2: {...}, id3: {...}}
+        """
+        if not context_ids:
+            return {}
+
+        cols = columns or list(self.config.custom_node_columns.keys())
+        if not cols:
+            return {}
+
+        # Always include id for mapping
+        select_cols = ["id"] + [c for c in cols if c != "id"]
+
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(f"""
+                SELECT {", ".join(select_cols)}
+                FROM {self.config.nodes_table}
+                WHERE id = ANY($1)
+            """, context_ids)
+
+        result = {}
+        for row in rows:
+            row_dict = dict(row)
+            node_id = row_dict.pop("id")
+            result[node_id] = row_dict
+
+        return result
 
     # =========================================================================
     # Cleanup
